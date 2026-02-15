@@ -84,7 +84,7 @@ python3 main.py -i video.mp4 -o vertical.mp4 --frame-skip 0
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--frame-skip` | `1` | Frames to skip during scene detection. `0` = every frame (most accurate, slowest). `1` = every other frame. Higher = faster |
+| `--frame-skip` | `0` | Frames to skip during scene detection. `0` = every frame (most accurate). `1` = every other frame (~2x faster). Higher = faster but may miss cuts |
 | `--downscale` | `0` (auto) | Downscale factor for scene detection. `0` = auto. `2`-`4` = faster but may miss subtle cuts |
 
 **Other:**
@@ -101,7 +101,7 @@ python3 main.py -i video.mp4 -o vertical.mp4 --frame-skip 0
 *   **Automatic Letterboxing:** When people are too spread out for a vertical crop, black bars are added to preserve the full shot.
 *   **Scene-by-Scene Processing:** Decisions are made per scene for consistent, logical edits.
 *   **Native Resolution:** Output height matches the source to prevent quality loss from upscaling.
-*   **Native FFmpeg Pipeline:** Video encoding runs entirely inside FFmpeg via `filter_complex` — Python never touches pixel data.
+*   **Frame-Accurate Processing:** Every frame is processed individually with the correct per-scene strategy — no timestamp rounding or scene boundary drift.
 *   **Hardware Encoder Support:** Optional `--encoder hw` auto-detects VideoToolbox (macOS) or NVENC (NVIDIA) with automatic fallback to libx264.
 *   **VFR Handling:** Variable frame rate sources are automatically normalized before processing.
 *   **Audio Sync:** Non-zero stream start times are detected and compensated to keep audio/video aligned.
@@ -133,8 +133,8 @@ Input Video
                 |
                 v
 +-------------------------------+
-| 4. FFmpeg filter_complex      |  Single FFmpeg command handles all
-|    (--quality, --encoder)     |  trim -> crop/scale/pad -> concat
+| 4. Frame Processing           |  Per-frame crop/scale/pad via OpenCV
+|    (--quality, --encoder)     |  piped to FFmpeg for encoding
 +---------------+---------------+
                 |
                 v
@@ -146,7 +146,7 @@ Input Video
           Output Video
 ```
 
-Steps 1-3 are the "planning" phase (Python + AI). Step 4 is the "encoding" phase (pure FFmpeg, no Python in the hot path).
+Steps 1-3 are the "planning" phase (Python + AI). Step 4 applies the plan frame-by-frame and encodes via FFmpeg.
 
 ---
 
@@ -159,7 +159,7 @@ Benchmarks on Apple M1 MacBook Pro (AC power):
 | 1280x720 | 49s | ~6s | 8.3x real-time |
 | 1920x1080 | 12 min | ~51s | 13.7x real-time |
 
-Scene detection is the dominant bottleneck (~50% of total time). Encoding via FFmpeg `filter_complex` runs at ~30-50x real-time depending on resolution.
+Scene detection is the dominant bottleneck (~50% of total time).
 
 ---
 
@@ -179,52 +179,25 @@ This script is built on a pipeline that uses specialized libraries for each step
     2.  `PySceneDetect` scans the video and returns a list of scene timestamps.
     3.  For each scene, `OpenCV` extracts a sample frame and `YOLOv8` detects people in it.
     4.  A set of rules determines the strategy (`TRACK` or `LETTERBOX`) for each scene based on the number and position of detected people.
-    5.  The script builds an FFmpeg `filter_complex` graph — one `trim->crop->scale` or `trim->scale->pad` chain per scene, concatenated together — and executes it as a single FFmpeg command. Python never touches pixel data; FFmpeg handles decode, filter, and encode entirely in C.
+    5.  OpenCV reads every frame sequentially. Each frame is cropped/resized (TRACK) or scaled/padded (LETTERBOX) according to its scene's strategy, then piped as raw pixels to FFmpeg for encoding. This frame-by-frame approach guarantees frame-accurate scene boundaries with no timestamp rounding errors.
     6.  Audio is extracted separately (with start-time offset correction), then merged with the processed video.
-
-*   **Performance & Optimizations:**
-    Since v1.3, the encoding pipeline runs entirely inside FFmpeg using a `filter_complex` graph. Python only acts as the "planner" (scene detection + YOLO analysis), then hands off a filtergraph to FFmpeg for execution. This eliminates all Python overhead from the hot path: no GIL contention, no BGR-YUV conversion, no per-frame memory allocation, no 6MB-per-frame pipe I/O.
-
-    *   **Encoding benchmarks (Apple M1):** 720p encodes at ~50x real-time, 1080p at ~30x real-time.
-    *   **End-to-end:** A 12-minute 1080p video completes in ~51 seconds (13.7x real-time). Scene detection is now the dominant bottleneck.
 
 ---
 
 ### Changelog
 
-#### v1.4.0 (2026-02-15) — Performance & Hardware Encoding
+#### v1.4.1 (2026-02-15) — Cropping Accuracy Fix
 
-**Performance:**
+*   **Fixed incorrect crop/letterbox decisions near scene boundaries.** The v1.3 `filter_complex` pipeline used seconds-based `trim` filters, which caused floating-point misalignment with the frame-based scene boundaries from PySceneDetect. This led to frames at scene transitions receiving the wrong strategy (e.g., a properly tracked person switching to letterbox mid-scene, or a group shot being cropped instead of letterboxed). Restored the original frame-by-frame processing pipeline which uses exact frame numbers for scene boundary matching, guaranteeing frame-accurate results.
 
-*   **~1.7x faster scene detection.** Migrated from deprecated `VideoManager` API to modern `open_video` + `SceneManager`. Default `frame_skip=1` processes every other frame and `luma_only` detection skips color channel comparisons. Both are configurable via `--frame-skip` and `--downscale` flags.
-*   **Batch YOLO inference.** All scene middle frames are now extracted in a single video open and processed as a batch, eliminating repeated file open/close overhead per scene.
+#### v1.4.0 (2026-02-15) — Hardware Encoding & Scene Detection Tuning
 
 **New Features:**
 
 *   **Hardware encoder support (`--encoder`).** New flag with three modes: `auto` (libx264, default for best quality/compatibility), `hw` (auto-detect VideoToolbox on macOS or NVENC on NVIDIA), or an explicit encoder name. Quality presets (`--quality`) map automatically per encoder type.
-*   **Configurable scene detection (`--frame-skip`, `--downscale`).** Power users can tune the speed/accuracy trade-off. Default `--frame-skip 1` is a good balance; use `0` for maximum accuracy on fast-cutting content.
+*   **Configurable scene detection (`--frame-skip`, `--downscale`).** Power users can tune the speed/accuracy trade-off. Default `--frame-skip 0` processes every frame for maximum accuracy; increase for faster detection on longer videos.
 
-#### v1.3.0 (2026-02-15) — Native FFmpeg Pipeline
-
-**Performance:**
-
-*   **3x faster video encoding via native FFmpeg `filter_complex`.** The entire frame processing pipeline has been moved out of Python and into a single FFmpeg command. Instead of decoding every frame into Python, manipulating it with numpy/OpenCV, and piping raw bytes back to FFmpeg, the script now builds an FFmpeg filtergraph (`trim` -> `crop`/`scale`/`pad` -> `concat`) and lets FFmpeg handle decode, filter, and encode in C — with zero-copy frame passing between stages. Python never touches pixel data during encoding.
-
-    Benchmarks on Apple M1 (MacBook Pro):
-
-    | Resolution | Duration | v1.2 (Python loop) | v1.3 (native FFmpeg) | Speedup |
-    |-----------|----------|--------------------|--------------------|---------|
-    | 1280x720 | 49s | 3.95s | **0.97s** | **4.1x** |
-    | 1920x1080 | 12 min | 62.8s | **21.1s** | **3.0x** |
-
-    End-to-end (including scene detection + YOLO analysis):
-
-    | Resolution / Duration | v1.2 total | v1.3 total | Speed |
-    |----------------------|-----------|-----------|-------|
-    | 720p / 49s | ~12s | **~6s** | 8.3x real-time |
-    | 1080p / 12 min | 93.5s | **51.3s** | 13.7x real-time |
-
-    Scene detection (PySceneDetect) is now the dominant bottleneck at ~50% of total time. Encoding is no longer the limiting factor.
+#### v1.3.0 (2026-02-15) — Configurable Output & Quality Presets
 
 **New Features:**
 

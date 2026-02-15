@@ -26,78 +26,53 @@ def get_face_cascade():
         _face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
     return _face_cascade
 
-def analyze_scenes_batch(video_path, scenes):
+def analyze_scene_content(video_path, scene_start_time, scene_end_time):
     """
-    Analyzes the middle frame of every scene in a single pass.
-
-    Opens the video once, extracts all middle frames, runs YOLO batch
-    inference, then performs face detection per person ROI.
-
-    Returns a list (one entry per scene) of detection lists.
+    Analyzes the middle frame of a scene to detect people and faces.
     """
     import cv2
-
-    # --- 1. Extract all middle frames in one video open ---
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"Error: Could not open video {video_path}")
-        return [[] for _ in scenes]
+        return []
 
-    frames = []
-    for start_time, end_time in scenes:
-        start_frame = start_time.get_frames()
-        end_frame = end_time.get_frames()
-        middle_frame = int(start_frame + (end_frame - start_frame) / 2)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame)
-        ret, frame = cap.read()
-        frames.append(frame if ret else None)
+    start_frame = scene_start_time.get_frames()
+    end_frame = scene_end_time.get_frames()
+    middle_frame_number = int(start_frame + (end_frame - start_frame) / 2)
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame_number)
+
+    ret, frame = cap.read()
+    if not ret:
+        cap.release()
+        return []
+
+    results = get_yolo_model()([frame], verbose=False)
+
+    detected_objects = []
+
+    for result in results:
+        boxes = result.boxes
+        for box in boxes:
+            if box.cls[0] == 0:
+                x1, y1, x2, y2 = [int(i) for i in box.xyxy[0]]
+                person_box = [x1, y1, x2, y2]
+
+                person_roi_gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+                faces = get_face_cascade().detectMultiScale(person_roi_gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+
+                face_box = None
+                if len(faces) > 0:
+                    fx, fy, fw, fh = faces[0]
+                    face_box = [x1 + fx, y1 + fy, x1 + fx + fw, y1 + fy + fh]
+
+                detected_objects.append({'person_box': person_box, 'face_box': face_box})
+
     cap.release()
-
-    # --- 2. Batch YOLO inference on all frames at once ---
-    valid_frames = [f for f in frames if f is not None]
-    if valid_frames:
-        all_results = get_yolo_model()(valid_frames, verbose=False)
-    else:
-        all_results = []
-
-    # Map results back — keep an iterator so we pull from all_results in order
-    results_iter = iter(all_results)
-    per_scene_results = []
-    for frame in frames:
-        if frame is not None:
-            per_scene_results.append(next(results_iter))
-        else:
-            per_scene_results.append(None)
-
-    # --- 3. Post-process: extract persons + face detection ---
-    face_cascade = get_face_cascade()
-    all_detections = []
-
-    for frame, result in zip(frames, per_scene_results):
-        detected_objects = []
-        if frame is not None and result is not None:
-            for box in result.boxes:
-                if box.cls[0] == 0:  # person class
-                    x1, y1, x2, y2 = [int(i) for i in box.xyxy[0]]
-                    person_box = [x1, y1, x2, y2]
-
-                    person_roi_gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
-                    faces = face_cascade.detectMultiScale(
-                        person_roi_gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30)
-                    )
-
-                    face_box = None
-                    if len(faces) > 0:
-                        fx, fy, fw, fh = faces[0]
-                        face_box = [x1 + fx, y1 + fy, x1 + fx + fw, y1 + fy + fh]
-
-                    detected_objects.append({'person_box': person_box, 'face_box': face_box})
-        all_detections.append(detected_objects)
-
-    return all_detections
+    return detected_objects
 
 
-def detect_scenes(video_path, downscale=0, frame_skip=1):
+def detect_scenes(video_path, downscale=0, frame_skip=0):
     """Detect scene boundaries.
 
     Args:
@@ -105,21 +80,24 @@ def detect_scenes(video_path, downscale=0, frame_skip=1):
         downscale: Downscale factor for processing (0 = auto-detect based on
                    resolution).  Higher values are faster but may miss subtle cuts.
         frame_skip: Number of frames to skip between each processed frame.
-                    0 = process every frame, 1 = every other frame, etc.
+                    0 = process every frame (default, most accurate).
     """
-    from scenedetect import open_video, SceneManager
+    from scenedetect import VideoManager, SceneManager
     from scenedetect.detectors import ContentDetector
-    video = open_video(video_path)
+    video_manager = VideoManager([video_path])
     scene_manager = SceneManager()
-    scene_manager.add_detector(ContentDetector(luma_only=True))
+    scene_manager.add_detector(ContentDetector())
     if downscale > 0:
-        scene_manager.auto_downscale = False
-        scene_manager.downscale = downscale
+        video_manager.set_downscale_factor(downscale)
     else:
-        scene_manager.auto_downscale = True
-    scene_manager.detect_scenes(video, show_progress=True, frame_skip=frame_skip)
+        video_manager.set_downscale_factor()
+    video_manager.start()
+    scene_manager.detect_scenes(frame_source=video_manager, show_progress=True,
+                                frame_skip=frame_skip)
     scene_list = scene_manager.get_scene_list()
-    return scene_list, video.frame_rate
+    fps = video_manager.get_framerate()
+    video_manager.release()
+    return scene_list, fps
 
 def get_enclosing_box(boxes):
     if not boxes:
@@ -334,57 +312,6 @@ def normalize_to_cfr(video_path, output_path, total_duration=0):
         return False
     return True
 
-def build_filtergraph(scenes_analysis, scenes, original_width, original_height,
-                      output_width, output_height, fps):
-    """
-    Builds an FFmpeg filter_complex string that processes all scenes in a single pass.
-    
-    For TRACK scenes: trim → crop → scale to output size
-    For LETTERBOX scenes: trim → scale to fit width → pad with black bars
-    Then concat all segments.
-    """
-    filters = []
-    segment_labels = []
-
-    for i, scene_data in enumerate(scenes_analysis):
-        start = scene_data['start_seconds']
-        end = scene_data['end_seconds']
-        strategy = scene_data['strategy']
-        target_box = scene_data['target_box']
-
-        # Trim this scene from the input
-        trim_filter = f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS"
-
-        if strategy == 'TRACK':
-            crop_box = calculate_crop_box(target_box, original_width, original_height)
-            x1, y1, x2, y2 = crop_box
-            crop_w = x2 - x1
-            crop_h = y2 - y1
-            # Crop around the target, then scale to output dimensions
-            filters.append(
-                f"{trim_filter},crop={crop_w}:{crop_h}:{x1}:{y1},"
-                f"scale={output_width}:{output_height},setsar=1[v{i}]"
-            )
-        else:  # LETTERBOX
-            scale_factor = output_width / original_width
-            scaled_height = int(original_height * scale_factor)
-            # Make sure scaled_height is even for yuv420p
-            if scaled_height % 2 != 0:
-                scaled_height += 1
-            y_offset = (output_height - scaled_height) // 2
-            # Scale to fit width, then pad to full output height with black bars
-            filters.append(
-                f"{trim_filter},scale={output_width}:{scaled_height},"
-                f"pad={output_width}:{output_height}:0:{y_offset}:black,setsar=1[v{i}]"
-            )
-        segment_labels.append(f"[v{i}]")
-
-    # Concatenate all segments
-    concat_inputs = ''.join(segment_labels)
-    filters.append(f"{concat_inputs}concat=n={len(segment_labels)}:v=1:a=0[outv]")
-
-    return ';'.join(filters)
-
 def detect_hw_encoder():
     """Probes FFmpeg for available hardware H.264 encoders.
 
@@ -473,9 +400,9 @@ if __name__ == '__main__':
                         help="Override FFmpeg x264 preset directly (ultrafast..veryslow). Overrides --quality.")
     parser.add_argument('--plan-only', action='store_true',
                         help="Only run scene detection and analysis (Steps 1-3), then print the processing plan without encoding.")
-    parser.add_argument('--frame-skip', type=int, default=1,
-                        help="Frames to skip during scene detection (default: 1 = every other frame). "
-                             "0 = process every frame (most accurate, slowest). Higher = faster but may miss quick cuts.")
+    parser.add_argument('--frame-skip', type=int, default=0,
+                        help="Frames to skip during scene detection (default: 0 = every frame, most accurate). "
+                             "1 = every other frame (~2x faster). Higher = faster but may miss quick cuts.")
     parser.add_argument('--downscale', type=int, default=0,
                         help="Downscale factor for scene detection (default: 0 = auto). "
                              "Higher values (2-4) are faster but may miss subtle scene changes.")
@@ -594,11 +521,9 @@ if __name__ == '__main__':
     if OUTPUT_WIDTH % 2 != 0:
         OUTPUT_WIDTH += 1
 
-    all_detections = analyze_scenes_batch(input_video, scenes)
-
     scenes_analysis = []
-    for i, (start_time, end_time) in enumerate(scenes):
-        analysis = all_detections[i]
+    for i, (start_time, end_time) in enumerate(tqdm(scenes, desc="Analyzing Scenes")):
+        analysis = analyze_scene_content(input_video, start_time, end_time)
         strategy, target_box = decide_cropping_strategy(analysis, original_height)
         scenes_analysis.append({
             'start_frame': start_time.get_frames(),
@@ -628,45 +553,83 @@ if __name__ == '__main__':
         print(f"⏱️  Analysis took {elapsed:.1f}s. Run without --plan-only to encode.")
         sys.exit(0)
 
-    print("\n✂️ Step 4: Processing video frames (native FFmpeg pipeline)...")
+    print("\n✂️ Step 4: Processing video frames...")
     step_start_time = time.time()
 
-    # Build a single FFmpeg filter_complex that handles all scenes in one pass —
-    # no Python in the hot path, no frame-by-frame piping.
-    filtergraph = build_filtergraph(
-        scenes_analysis, scenes, original_width, original_height,
-        OUTPUT_WIDTH, OUTPUT_HEIGHT, fps
-    )
-
     command = [
-        'ffmpeg', '-y', '-i', input_video,
-        '-filter_complex', filtergraph,
-        '-map', '[outv]',
+        'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
+        '-s', f'{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}', '-pix_fmt', 'bgr24',
+        '-r', str(fps), '-i', '-',
         '-c:v', encoder_name, *enc_args,
         '-pix_fmt', 'yuv420p',
         '-r', str(fps), '-vsync', 'cfr',
         '-an', temp_video_output
     ]
 
-    total_duration = media_info.get('duration', 0) if media_info else 0
-    stderr_text = ''
-    if total_duration > 0:
-        returncode, stderr_text = run_ffmpeg_with_progress(command, total_duration, desc="Encoding")
-    else:
-        try:
-            subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            returncode = 0
-        except subprocess.CalledProcessError as e:
-            returncode = e.returncode
-            stderr_text = e.stderr.decode()
+    ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
-    if returncode != 0:
-        print("\n❌ FFmpeg processing failed.")
-        if stderr_text:
-            # Print last 30 lines of stderr (skip the FFmpeg banner)
-            error_lines = stderr_text.strip().split('\n')
-            for line in error_lines[-30:]:
-                print(f"  {line}")
+    cap = cv2.VideoCapture(input_video)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    frame_number = 0
+    current_scene_index = 0
+    dropped_frames = 0
+    last_output_frame = None
+
+    num_scenes = len(scenes_analysis)
+    with tqdm(total=total_frames, desc=f"Processing [scene 1/{num_scenes}]",
+              unit="fr", dynamic_ncols=True,
+              bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            if current_scene_index < len(scenes_analysis) - 1 and \
+               frame_number >= scenes_analysis[current_scene_index + 1]['start_frame']:
+                current_scene_index += 1
+                pbar.set_description(f"Processing [scene {current_scene_index + 1}/{num_scenes}]")
+
+            scene_data = scenes_analysis[current_scene_index]
+            strategy = scene_data['strategy']
+            target_box = scene_data['target_box']
+
+            try:
+                if strategy == 'TRACK':
+                    crop_box = calculate_crop_box(target_box, original_width, original_height)
+                    processed_frame = frame[crop_box[1]:crop_box[3], crop_box[0]:crop_box[2]]
+                    output_frame = cv2.resize(processed_frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+                else:  # LETTERBOX
+                    scale_factor = OUTPUT_WIDTH / original_width
+                    scaled_height = int(original_height * scale_factor)
+                    scaled_frame = cv2.resize(frame, (OUTPUT_WIDTH, scaled_height))
+
+                    output_frame = np.zeros((OUTPUT_HEIGHT, OUTPUT_WIDTH, 3), dtype=np.uint8)
+                    y_offset = (OUTPUT_HEIGHT - scaled_height) // 2
+                    output_frame[y_offset:y_offset + scaled_height, :] = scaled_frame
+                last_output_frame = output_frame
+            except Exception:
+                dropped_frames += 1
+                if last_output_frame is not None:
+                    output_frame = last_output_frame
+                else:
+                    output_frame = np.zeros((OUTPUT_HEIGHT, OUTPUT_WIDTH, 3), dtype=np.uint8)
+
+            ffmpeg_process.stdin.write(output_frame.tobytes())
+            frame_number += 1
+            pbar.update(1)
+
+    if dropped_frames > 0:
+        print(f"  ⚠️  {dropped_frames} frame(s) could not be processed and were duplicated from the previous frame.")
+
+    ffmpeg_process.stdin.close()
+    stderr_output = ffmpeg_process.stderr.read().decode()
+    ffmpeg_process.wait()
+    cap.release()
+
+    if ffmpeg_process.returncode != 0:
+        print("\n❌ FFmpeg frame processing failed.")
+        print("Stderr:", stderr_output)
         cleanup_temp_files()
         sys.exit(1)
     step_end_time = time.time()
