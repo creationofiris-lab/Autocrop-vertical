@@ -302,7 +302,35 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Smartly crops a horizontal video into a vertical one.")
     parser.add_argument('-i', '--input', type=str, required=True, help="Path to the input video file.")
     parser.add_argument('-o', '--output', type=str, required=True, help="Path to the output video file.")
+    parser.add_argument('--ratio', type=str, default='9:16',
+                        help="Output aspect ratio as W:H (default: 9:16). Examples: 9:16, 4:5, 1:1")
+    parser.add_argument('--quality', type=str, default='balanced', choices=['fast', 'balanced', 'high'],
+                        help="Encoding quality preset (default: balanced). fast=quick encode, balanced=good quality, high=best quality/slow")
+    parser.add_argument('--crf', type=int, default=None,
+                        help="Override CRF value directly (0-51, lower=better quality). Overrides --quality.")
+    parser.add_argument('--preset', type=str, default=None,
+                        help="Override FFmpeg x264 preset directly (ultrafast..veryslow). Overrides --quality.")
+    parser.add_argument('--plan-only', action='store_true',
+                        help="Only run scene detection and analysis (Steps 1-3), then print the processing plan without encoding.")
     args = parser.parse_args()
+
+    # Parse aspect ratio
+    try:
+        ratio_parts = args.ratio.split(':')
+        ASPECT_RATIO = int(ratio_parts[0]) / int(ratio_parts[1])
+    except (ValueError, IndexError, ZeroDivisionError):
+        print(f"❌ Invalid aspect ratio '{args.ratio}'. Use format W:H (e.g. 9:16, 4:5, 1:1)")
+        sys.exit(1)
+
+    # Resolve encoding quality settings
+    quality_presets = {
+        'fast':     {'crf': 28, 'preset': 'veryfast'},
+        'balanced': {'crf': 23, 'preset': 'fast'},
+        'high':     {'crf': 18, 'preset': 'slow'},
+    }
+    q = quality_presets[args.quality]
+    enc_crf = str(args.crf if args.crf is not None else q['crf'])
+    enc_preset = args.preset if args.preset is not None else q['preset']
 
     # Defer heavy imports until after arg parsing so --help is instant
     import cv2
@@ -359,7 +387,8 @@ if __name__ == '__main__':
         total_frames_est = int(media_info.get('duration', 0) * media_info.get('fps', 0))
         if total_frames_est > 0:
             print(f"   ~{total_frames_est:,} frames to process")
-        print()
+    print(f"   Ratio: {args.ratio} | Quality: {args.quality} (crf={enc_crf}, preset={enc_preset})")
+    print()
 
     # Pre-processing: normalize VFR to CFR if needed
     if is_variable_frame_rate(input_video):
@@ -418,6 +447,14 @@ if __name__ == '__main__':
         end_time = scenes[i][1].get_timecode()
         print(f"  - Scene {i+1} ({start_time} -> {end_time}): Found {num_people} person(s). Strategy: {strategy}")
 
+    if args.plan_only:
+        track_count = sum(1 for s in scenes_analysis if s['strategy'] == 'TRACK')
+        letterbox_count = sum(1 for s in scenes_analysis if s['strategy'] == 'LETTERBOX')
+        elapsed = time.time() - script_start_time
+        print(f"\n📊 Plan summary: {track_count} TRACK / {letterbox_count} LETTERBOX scenes")
+        print(f"⏱️  Analysis took {elapsed:.1f}s. Run without --plan-only to encode.")
+        sys.exit(0)
+
     print("\n✂️ Step 4: Processing video frames...")
     step_start_time = time.time()
     
@@ -425,7 +462,8 @@ if __name__ == '__main__':
         'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
         '-s', f'{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}', '-pix_fmt', 'bgr24',
         '-r', str(fps), '-i', '-',
-        '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+        '-c:v', 'libx264', '-preset', enc_preset, '-crf', enc_crf,
+        '-pix_fmt', 'yuv420p',
         '-r', str(fps), '-vsync', 'cfr',
         '-an', temp_video_output
     ]

@@ -20,6 +20,16 @@ Instead of a simple, static center crop, this script analyzes video content scen
 
 ### Changelog
 
+#### v1.2.0 (2026-02-15)
+
+**New Features:**
+
+*   **Configurable aspect ratio (`--ratio`).** Output is no longer locked to 9:16. Use `--ratio 4:5` for Instagram feed, `--ratio 1:1` for square, or any custom W:H ratio.
+*   **Quality presets (`--quality`).** Choose between `fast` (CRF 28, veryfast), `balanced` (CRF 23, fast — default), or `high` (CRF 18, slow). Power users can override directly with `--crf` and `--preset`.
+*   **Dry-run mode (`--plan-only`).** Runs scene detection and analysis only, prints the processing plan, and exits without encoding. Useful for previewing decisions before committing to a long encode.
+*   **Fixed output pixel format.** Encoder now outputs `yuv420p` instead of `yuv444p`, which is compatible with all players and platforms and produces smaller files.
+*   **Improved logging and progress reporting.** Input file summary upfront, progress bars on all slow operations, current scene indicator during encoding, and a final summary with output size, compression ratio, and processing speed.
+
 #### v1.1.0 (2026-02-14)
 
 **Bug Fixes:**
@@ -39,7 +49,6 @@ Instead of a simple, static center crop, this script analyzes video content scen
 *   **Lazy model loading.** YOLO and Haar cascade models are now loaded on first use instead of at import time. Heavy library imports (`torch`, `ultralytics`, `cv2`, etc.) are deferred until after argument parsing, so `--help` is instant.
 *   **Pinned dependency versions.** `requirements.txt` now specifies compatible version ranges to prevent breakage from upstream changes.
 *   **Replaced `exit()` with `sys.exit(1)`.** Ensures proper exit codes and reliable behavior in all environments.
-*   **Improved logging and progress reporting.** The script now prints an input file summary upfront (resolution, duration, fps, codec, file size, estimated frame count), shows progress bars on all slow operations (scene detection, VFR normalization, frame processing), displays the current scene during encoding, and prints a final summary with output file size, compression ratio, and processing speed.
 
 ---
 
@@ -88,10 +97,19 @@ This script is built on a pipeline that uses specialized libraries for each step
     The `yolov8n.pt` model weights will be downloaded automatically on the first run.
 
 3.  **Run the script:**
-    Use the `--input` and `--output` arguments to specify the source and destination files.
 
     ```bash
-    python main.py --input path/to/horizontal_video.mp4 --output path/to/vertical_video.mp4
+    # Basic usage (9:16, balanced quality)
+    python3 main.py -i video.mp4 -o vertical.mp4
+
+    # Instagram feed (4:5) with high quality
+    python3 main.py -i video.mp4 -o vertical.mp4 --ratio 4:5 --quality high
+
+    # Preview the processing plan without encoding
+    python3 main.py -i video.mp4 -o vertical.mp4 --plan-only
+
+    # Full control over encoding
+    python3 main.py -i video.mp4 -o vertical.mp4 --crf 20 --preset medium
     ```
 
 ---
